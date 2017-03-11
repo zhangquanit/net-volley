@@ -1,0 +1,475 @@
+Volley :用于创建RequestQueue
+RequestQueue: 请求队列，用于添加请求，分发请求, 如果请求可以使用缓存，则将该请求添加到缓存请求队列中，否则直接添加到网络请求队列中
+CacheDispatcher ：缓存请求线程，首先获取本地缓存，如果缓存存在且未失效 则回调response，否则将该请求添加到网络请求队列中
+NetworkDispatcher ：网络请求线程，默认只有4个,4个线程共同处理一个任务队列，如果需要缓存，则将请求的网络数据后缓存到本地
+
+Network: 持有HttpStack，执行网络请求，由NetworkDispatcher调用，根据不同的http状态码以及异常选择是否重试，比如301，302需要重定向到location地址，连接超时，需要继续请求。
+HttpStack：具体的网络请求方式，HurlStack：基于HttpUrlConnection实现，HttpClientStack：基于HttpClient实现
+
+
+ExecutorDelivery：将子线程中的执行结果，在主线程中进行回调
+Request :封装请求
+Response :响应
+NetworkResponse：网络请求的响应信息，不管是网络请求还是本地缓存 都会先封装成NetworkResponse，然后解析成Response
+
+工作流：
+通过Volley创建一个RequestQueue(1个CacheDispatcher线程，4个NetworkDispatcher线程)并开启线程。创建请求，并调用RequestQueue的add方法，
+首先判断该请求是否使用缓存，如果不使用缓存，则直接将该请求添加到网络请求队列中，否则首先根据cacheKey判断该请求在mWaitingRequests中是否已存在( Map<String, Queue<Request<?>>> mWaitingRequests)
+如果是不存在，则将该请求添加到mCacheQueue缓存请求队列中，CacheDispatcher线程会从缓存请求队列中不断取出请求，然后获取本地缓存，如果本地缓存存在且有效，则将
+本地缓存解析成Response，然后调用ExecutorDelivery将响应信息回调给调用者，否则将该请求添加到mNetworkQueue网络请求队列中。当该请求执行完毕后，从mWaitingRequests
+中取出与其相同url的请求，添加到mCacheQueue队列中执行。
+
+
+
+一、Volley
+用于创建RequestQueue
+    public static RequestQueue newRequestQueue(Context context, HttpStack stack, int maxDiskCacheBytes) {
+        File cacheDir = new File(context.getCacheDir(), DEFAULT_CACHE_DIR); //缓存目录
+
+        String userAgent = "volley/0";
+        try {
+            String packageName = context.getPackageName();
+            PackageInfo info = context.getPackageManager().getPackageInfo(packageName, 0);
+            userAgent = packageName + "/" + info.versionCode;
+        } catch (NameNotFoundException e) {
+        }
+
+        if (stack == null) {
+            if (Build.VERSION.SDK_INT >= 9) { //2.3版本之后使用HttpUrlConnection
+                stack = new HurlStack();
+            } else {
+                // Prior to Gingerbread, HttpUrlConnection was unreliable.
+                // See: http://android-developers.blogspot.com/2011/09/androids-http-clients.html
+                stack = new HttpClientStack(AndroidHttpClient.newInstance(userAgent)); //2.3之前使用HttpClient
+            }
+        }
+        Network network = new BasicNetwork(stack); //实际的网络请求
+        RequestQueue queue;
+        if (maxDiskCacheBytes <= -1)
+        {
+           queue = new RequestQueue(new DiskBasedCache(cacheDir), network); 	// 使用默认缓存大小   5 * 1024 * 1024
+        }else{
+        	// 指定了缓存大小
+        	queue = new RequestQueue(new DiskBasedCache(cacheDir, maxDiskCacheBytes), network);
+        }
+        queue.start(); //开启线程
+        return queue;
+    }
+
+ 二、RequestQueue
+请求队列，用于执行请求
+public class RequestQueue {
+
+	//开启线程
+    public void start() {
+        stop();  // 停止所有的任务
+        // 开启线程处理缓存请求
+        mCacheDispatcher = new CacheDispatcher(mCacheQueue, mNetworkQueue, mCache, mDelivery);
+        mCacheDispatcher.start();
+
+        // 开启线程处理网络请求，默认是4个线程
+        for (int i = 0; i < mDispatchers.length; i++) {
+            NetworkDispatcher networkDispatcher = new NetworkDispatcher(mNetworkQueue, mNetwork,
+                    mCache, mDelivery);
+            mDispatchers[i] = networkDispatcher;
+            networkDispatcher.start();
+        }
+    }
+	//执行请求
+    public <T> Request<T> add(Request<T> request) {
+        request.setRequestQueue(this);
+        synchronized (mCurrentRequests) { //添加到当前执行队列中
+            mCurrentRequests.add(request);
+        }
+
+        // 设置序列号
+        request.setSequence(getSequenceNumber());
+        request.addMarker("add-to-queue");
+
+
+        if (!request.shouldCache()) { //如果请求不使用缓存,则直接添加到网络请求队列中
+            mNetworkQueue.add(request);
+            return request;
+        }
+
+        // Insert request into stage if there's already a request with the same cache key in flight.
+        synchronized (mWaitingRequests) {
+            String cacheKey = request.getCacheKey(); //mMethod + ":" + mUrl
+            if (mWaitingRequests.containsKey(cacheKey)) { //当前已存在同样url的请求，先放到队列中，等到上一个请求执行完毕后，统一执行。（这样可以避免重复从网络请求数据）
+                Queue<Request<?>> stagedRequests = mWaitingRequests.get(cacheKey);
+                if (stagedRequests == null) {
+                    stagedRequests = new LinkedList<Request<?>>();
+                }
+                stagedRequests.add(request);
+                mWaitingRequests.put(cacheKey, stagedRequests);
+
+            } else { //当前该url只有一个请求
+                mWaitingRequests.put(cacheKey, null);
+                mCacheQueue.add(request); //先从本地缓存中获取
+            }
+            return request;
+        }
+    }
+	  //请求执行完毕
+    <T> void finish(Request<T> request) {
+        synchronized (mCurrentRequests) {
+            mCurrentRequests.remove(request);
+        }
+        synchronized (mFinishedListeners) {
+          for (RequestFinishedListener<T> listener : mFinishedListeners) {
+            listener.onRequestFinished(request);
+          }
+        }
+
+        if (request.shouldCache()) {
+            synchronized (mWaitingRequests) {
+                String cacheKey = request.getCacheKey();
+                Queue<Request<?>> waitingRequests = mWaitingRequests.remove(cacheKey);
+                if (waitingRequests != null) {
+                    mCacheQueue.addAll(waitingRequests); //添加到缓存请求队列中执行，如果上一个请求从网络获取的话，同样url的请求只需从本地缓存中获取。
+                }
+            }
+        }
+    }
+}
+
+三、CacheDispatcher、NetworkDispatcher
+1、缓存分发器线程
+public class CacheDispatcher extends Thread {
+    private final BlockingQueue<Request<?>> mCacheQueue; //缓存请求分发器
+    private final BlockingQueue<Request<?>> mNetworkQueue; // 网络请求分发器
+    private final Cache mCache; //本地缓存
+    private final ResponseDelivery mDelivery; //用于传递response和errors
+    private volatile boolean mQuit = false; //是否停止
+
+}
+2、网络分发器线程：从网络请求数据，
+public class NetworkDispatcher extends Thread {
+    private final BlockingQueue<Request<?>> mQueue; //请求队列
+    private final Network mNetwork; //执行网络请求
+    private final Cache mCache; //本地缓存
+    private final ResponseDelivery mDelivery; //用于传递response和errors
+    private volatile boolean mQuit = false; //是否停止
+
+}
+
+四、网络请求
+获取NetworkResponse
+
+public interface Network {
+    public NetworkResponse performRequest(Request<?> request) throws VolleyError;
+}
+public class BasicNetwork implements Network {
+    protected final HttpStack mHttpStack; //实际的网络请求
+	public BasicNetwork(HttpStack httpStack) {
+
+	}
+
+    @Override
+    public NetworkResponse performRequest(Request<?> request) throws VolleyError {
+        long requestStart = SystemClock.elapsedRealtime();
+        while (true) { // while(true) 针对某些情况，比如301，302允许重试
+            HttpResponse httpResponse = null;
+            byte[] responseContents = null;
+            Map<String, String> responseHeaders = Collections.emptyMap();
+
+            try {
+                // Gather headers.
+                Map<String, String> headers = new HashMap<String, String>();
+                addCacheHeaders(headers, request.getCacheEntry()); //添加缓存消息头
+                httpResponse = mHttpStack.performRequest(request, headers); //执行请求
+                StatusLine statusLine = httpResponse.getStatusLine(); // 响应行
+                int statusCode = statusLine.getStatusCode();
+
+                responseHeaders = convertHeaders(httpResponse.getAllHeaders());//响应消息头
+
+                // 304 资源为更改
+                if (statusCode == HttpStatus.SC_NOT_MODIFIED) { //304
+
+                    Entry entry = request.getCacheEntry(); //缓存数据
+                    if (entry == null) {
+                        return new NetworkResponse(HttpStatus.SC_NOT_MODIFIED, null,
+                                responseHeaders, true,
+                                SystemClock.elapsedRealtime() - requestStart);
+                    }
+                    entry.responseHeaders.putAll(responseHeaders);//保存headers
+                    return new NetworkResponse(HttpStatus.SC_NOT_MODIFIED, entry.data,
+                            entry.responseHeaders, true,
+                            SystemClock.elapsedRealtime() - requestStart);
+                }
+
+                // 301 302 ,需要重定向请求
+                if (statusCode == HttpStatus.SC_MOVED_PERMANENTLY || statusCode == HttpStatus.SC_MOVED_TEMPORARILY) {
+                	String newUrl = responseHeaders.get("Location"); //解析重定向url， 需要继续请求
+                	request.setRedirectUrl(newUrl);
+                }
+
+                //读取响应消息体
+                if (httpResponse.getEntity() != null) {
+                  responseContents = entityToBytes(httpResponse.getEntity());
+                } else {
+                  responseContents = new byte[0];
+                }
+
+                // 请求耗时
+                long requestLifetime = SystemClock.elapsedRealtime() - requestStart;
+                logSlowRequests(requestLifetime, request, responseContents, statusLine);
+
+                //其他非正常响应
+                if (statusCode < 200 || statusCode > 299) {
+                    throw new IOException(); //然后在catch(IOException)中去判断是否需要重试
+                }
+                return new NetworkResponse(statusCode, responseContents, responseHeaders, false,
+                        SystemClock.elapsedRealtime() - requestStart);
+            } catch (SocketTimeoutException e) {
+                attemptRetryOnException("socket", request, new TimeoutError());
+            } catch (ConnectTimeoutException e) {
+                attemptRetryOnException("connection", request, new TimeoutError());
+            } catch (MalformedURLException e) {
+                throw new RuntimeException("Bad URL " + request.getUrl(), e);
+            } catch (IOException e) {
+                int statusCode = 0; //状态码
+
+                if (httpResponse != null) {
+                    statusCode = httpResponse.getStatusLine().getStatusCode();
+                } else {
+                    throw new NoConnectionError(e); //如果没有httpResponse，则无连接
+                }
+
+                NetworkResponse networkResponse = null;
+                if (responseContents != null) { //如果有响应消息
+                    networkResponse = new NetworkResponse(statusCode, responseContents,
+                            responseHeaders, false, SystemClock.elapsedRealtime() - requestStart);
+                    if (statusCode == HttpStatus.SC_UNAUTHORIZED ||
+                            statusCode == HttpStatus.SC_FORBIDDEN) { //401或403 需要授权访问
+                        attemptRetryOnException("auth",
+                                request, new AuthFailureError(networkResponse));
+                    } else if (statusCode == HttpStatus.SC_MOVED_PERMANENTLY ||
+                    			statusCode == HttpStatus.SC_MOVED_TEMPORARILY) { //301或302需要重定向访问
+                        attemptRetryOnException("redirect",
+                                request, new RedirectError(networkResponse));
+                    } else { // 以5开头的 表示服务器错误
+                        // TODO: Only throw ServerError for 5xx status codes.
+                        throw new ServerError(networkResponse);
+                    }
+                } else {
+                    throw new NetworkError(e); //抛出异常
+                }
+            }
+        }
+    }
+
+}
+重试策略：RetryPolicy
+
+1、需要重试的有
+SocketTimeoutException
+ConnectTimeoutException
+IOException：401或403 需要授权访问；301或302需要重定向访问；
+2、不需要重试的异常
+MalformedURLException、VolleyError及其子类
+
+五、网络解析
+解析NetWork返回的NetworkResponse,生成Response
+
+NetworkResponse networkResponse = mNetwork.performRequest(request);
+Response<?> response = request.parseNetworkResponse(networkResponse);//由request负责解析（具体的请求具体解析）
+
+比如StringRequest，解析成String
+    @Override
+    protected Response<String> parseNetworkResponse(NetworkResponse response) {
+        String parsed;
+        try {
+            parsed = new String(response.data, HttpHeaderParser.parseCharset(response.headers));
+        } catch (UnsupportedEncodingException e) {
+            parsed = new String(response.data);
+        }
+		 Cache.Entry entry=HttpHeaderParser.parseCacheHeaders(response); //根据响应消息头里面的缓存字段，生成Cache.Entry，下次可使用它来检测缓存是否可用
+        return Response.success(parsed,entry );
+    }
+
+比如JsonObjectRequest，解析成JsonObject
+    @Override
+    protected Response<JSONObject> parseNetworkResponse(NetworkResponse response) {
+        try {
+		     //json字符串
+            String jsonString = new String(response.data,
+                    HttpHeaderParser.parseCharset(response.headers, PROTOCOL_CHARSET));
+			//解析生成缓存信息
+		    Cache.Entry entry=HttpHeaderParser.parseCacheHeaders(response); //根据响应消息头里面的缓存字段，生成Cache.Entry，下次可使用它来检测缓存是否可用
+            //返回response
+			return Response.success(new JSONObject(jsonString),entry);
+        } catch (UnsupportedEncodingException e) {
+            return Response.error(new ParseError(e));
+        } catch (JSONException je) {
+            return Response.error(new ParseError(je));
+        }
+    }
+public class Response<T> {
+
+    public interface Listener<T> {
+        public void onResponse(T response);
+    }
+
+    public interface ErrorListener {
+        public void onErrorResponse(VolleyError error);
+    }
+
+    public static <T> Response<T> success(T result, Cache.Entry cacheEntry) {
+        return new Response<T>(result, cacheEntry);
+    }
+    public static <T> Response<T> error(VolleyError error) {
+        return new Response<T>(error);
+    }
+
+    public final T result;  //解析的数据 比如String、JsonObject、JsonArray等
+    public final Cache.Entry cacheEntry; //根据缓存消息头生成的缓存
+    public final VolleyError error;
+    public boolean intermediate = false;
+
+    public boolean isSuccess() {
+        return error == null;
+    }
+
+    private Response(T result, Cache.Entry cacheEntry) {
+        this.result = result;
+        this.cacheEntry = cacheEntry;
+        this.error = null;
+    }
+
+    private Response(VolleyError error) {
+        this.result = null;
+        this.cacheEntry = null;
+        this.error = error;
+    }
+}
+六、网络缓存
+mCache.put(request.getCacheKey(), response.cacheEntry);
+
+public class DiskBasedCache implements Cache {
+ key=mMethod + ":" + mUrl;
+    public synchronized void put(String key, Entry entry) {
+
+	}
+    public Entry get(String key);
+    public void remove(String key);
+    public void clear();
+}
+七、结果回调
+ mDelivery.postResponse(request, response);
+public class ExecutorDelivery implements ResponseDelivery {
+
+    private final Executor mResponsePoster;
+
+    public ExecutorDelivery(final Handler handler) {
+        mResponsePoster = new Executor() {
+            @Override
+            public void execute(Runnable command) {
+                handler.post(command); //post到主线程中执行
+            }
+        };
+    }
+   private class ResponseDeliveryRunnable implements Runnable {
+        private final Request mRequest;
+        private final Response mResponse;
+        private final Runnable mRunnable;
+
+        public ResponseDeliveryRunnable(Request request, Response response, Runnable runnable) {
+            mRequest = request;
+            mResponse = response;
+            mRunnable = runnable;
+        }
+		@Override
+		public void postResponse(Request<?> request, Response<?> response, Runnable runnable) {
+			request.markDelivered();
+			request.addMarker("post-response");
+			mResponsePoster.execute(new ResponseDeliveryRunnable(request, response, runnable));
+		}
+
+		@Override
+		public void postError(Request<?> request, VolleyError error) {
+			request.addMarker("post-error");
+			Response<?> response = Response.error(error);
+			mResponsePoster.execute(new ResponseDeliveryRunnable(request, response, null));
+		}
+        @SuppressWarnings("unchecked")
+        @Override
+        public void run() {
+            // 如果请求已取消，则不再回调
+            if (mRequest.isCanceled()) {
+                mRequest.finish("canceled-at-delivery");
+                return;
+            }
+
+            if (mResponse.isSuccess()) {
+                mRequest.deliverResponse(mResponse.result); //成功回调
+            } else {
+                mRequest.deliverError(mResponse.error); //失败回调
+            }
+
+            if (mResponse.intermediate) {
+                mRequest.addMarker("intermediate-response");
+            } else {
+                mRequest.finish("done"); //请求执行完毕
+            }
+
+            // If we have been provided a post-delivery runnable, run it.
+            if (mRunnable != null) {
+                mRunnable.run();
+            }
+       }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
