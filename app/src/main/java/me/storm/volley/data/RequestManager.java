@@ -44,7 +44,7 @@ public class RequestManager {
         }
         mRequestQueue.add(request);
     }
-	
+
 	public static void cancelAll(Object tag) {
         mRequestQueue.cancelAll(tag);
     }

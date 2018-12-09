@@ -95,7 +95,8 @@ public class RequestQueue {
         // Insert request into stage if there's already a request with the same cache key in flight.
         synchronized (mWaitingRequests) {
             String cacheKey = request.getCacheKey(); //mMethod + ":" + mUrl
-            if (mWaitingRequests.containsKey(cacheKey)) { //当前已存在同样url的请求，先放到队列中，等到上一个请求执行完毕后，统一执行。（这样可以避免重复从网络请求数据）
+            if (mWaitingRequests.containsKey(cacheKey)) {
+            //当前已存在同样url的请求，先放到队列中，等到上一个请求执行完毕后(回调finish())，会将请求添加到mCacheQueue中，从缓存中获取，避免重复请求网络。
                 Queue<Request<?>> stagedRequests = mWaitingRequests.get(cacheKey);
                 if (stagedRequests == null) {
                     stagedRequests = new LinkedList<Request<?>>();
@@ -136,8 +137,8 @@ public class RequestQueue {
 三、CacheDispatcher、NetworkDispatcher
 1、缓存分发器线程
 public class CacheDispatcher extends Thread {
-    private final BlockingQueue<Request<?>> mCacheQueue; //缓存请求分发器
-    private final BlockingQueue<Request<?>> mNetworkQueue; // 网络请求分发器
+    private final BlockingQueue<Request<?>> mCacheQueue; //缓存请求队列
+    private final BlockingQueue<Request<?>> mNetworkQueue; // 网络请求队列
     private final Cache mCache; //本地缓存
     private final ResponseDelivery mDelivery; //用于传递response和errors
     private volatile boolean mQuit = false; //是否停止
